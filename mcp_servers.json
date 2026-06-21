@@ -1,0 +1,11 @@
+{
+    "_comment": "MCP Server Registry — configure each MCP server the agent should connect to.",
+
+    "servers": {
+        "google-calendar": {
+            "command": ".venv/Scripts/python.exe",
+            "args": ["-m", "agent.mcp.servers.calendar_server"],
+            "env": {}
+        }
+    }
+}

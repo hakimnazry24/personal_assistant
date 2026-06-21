@@ -16,22 +16,31 @@
 
 ## 2. Repository Layout
 
-```
+```json
 personal_assistant/
 ├── .env                          # API key + config (gitignored)
 ├── .env.example                  # Template for .env (committed)
 ├── .gitignore
-├── requirements.txt              # openai, python-dotenv
-├── main.py                       # CLI entry point (python main.py | python main.py --test)
+├── requirements.txt              # openai, python-dotenv, mcp
+├── main.py                       # CLI entry point (python main.py | --test | --test-tools)
 ├── AGENTS.md                     # This file
 ├── README.md                     # Human-facing docs
+├── mcp_servers.json              # MCP server registry (for external MCP servers)
 ├── config/
 │   ├── __init__.py
 │   └── settings.py               # Loads .env via python-dotenv; Settings dataclass
 └── agent/
     ├── __init__.py
-    ├── core.py                    # Agent class — wraps OpenAI client pointed at DeepSeek
-    ├── cli.py                     # Interactive CLI with /exit, /clear, /help commands
+    ├── core.py                    # Agent class — chat-only + tool-calling loop
+    ├── cli.py                     # Async CLI with tool support + /tools command
+    ├── mcp/
+    │   ├── __init__.py            # Exports MCPClient, MCPManager
+    │   ├── client.py              # MCPClient — stdio transport for external MCP servers
+    │   ├── manager.py             # MCPManager — multi-server lifecycle + tool registry
+    │   ├── adapters.py            # InProcessMCPAdapter — no-subprocess tool calling
+    │   └── servers/
+    │       ├── __init__.py
+    │       └── calendar_server.py # FastMCP server with mock calendar tools
     └── tools/
         ├── __init__.py
         ├── base.py                # BaseTool (ABC) + ToolResult (dataclass)
@@ -44,14 +53,62 @@ personal_assistant/
 
 ## 3. Architecture
 
-### 3.1 Core Flow
+### 3.1 Core Flow (Chat Only)
 
 ```
 User (CLI stdin) → cli.py → Agent.chat_with_history() → OpenAI SDK → DeepSeek API → Response → stdout
 ```
 
+### 3.2 Tool-Calling Flow (Chat + Tools)
+
+```
+User: "What's on my calendar tomorrow?"
+  │
+  ▼
+cli.py → Agent.chat_with_tools()
+  │
+  ▼
+ToolProvider.list_all_tools() → builds OpenAI tool definitions
+  │
+  ▼
+Agent sends [system prompt, history, tool defs] → DeepSeek API
+  │
+  ▼
+DeepSeek responds: { tool_calls: [{ name: "list_events", args: { date: "..." } }] }
+  │
+  ▼
+Agent calls ToolProvider.call_tool("list_events", { date: "..." })
+  │
+  ▼
+InProcessMCPAdapter → calendar_server.list_events() → returns mock events
+  │
+  ▼
+Tool result sent back to DeepSeek as a "tool" role message
+  │
+  ▼
+DeepSeek formulates final text response with the event data
+  │
+  ▼
+User sees: "Tomorrow you have 3 events: Morning Standup, Lunch, Project Review"
+```
+
+### 3.3 Tool Providers
+
+The agent uses a `ToolProvider` protocol — any object with these methods works:
+- `started: bool` — whether tools are available
+- `list_all_tools() -> list[dict]` — get tool definitions
+- `call_tool(name, args) -> Any` — execute a tool
+- `shutdown_all()` — cleanup
+
+Two implementations exist:
+- **`MCPManager`** — connects to external MCP servers via stdio (for Node.js servers, etc.)
+- **`InProcessMCPAdapter`** — runs tools directly in Python (no subprocess, more reliable)
+
+The in-process adapter is the default (used when `mcp_servers.json` has no servers).
+
 - `cli.py` manages the read-eval-print loop and conversation history (list of `{role, content}` dicts).
 - `Agent` (in `core.py`) wraps the OpenAI SDK, prepends the system prompt, and calls `client.chat.completions.create()`.
+- When tools are available, `Agent.chat_with_tools()` sends tool definitions alongside messages and handles the tool-calling loop (up to `AGENT_MAX_TOOL_ROUNDS` rounds).
 - `config/settings.py` loads all configuration from `.env` via `python-dotenv`. It validates that `DEEPSEEK_API_KEY` is set on `Agent.__init__`.
 
 ### 3.2 Tool System (Planned)
@@ -91,6 +148,9 @@ pip install -r requirements.txt
 # Test connectivity
 python main.py --test
 
+# Test tool-calling (MCP + function calling)
+python main.py --test-tools
+
 # Start interactive chat
 python main.py
 ```
@@ -99,6 +159,7 @@ CLI commands during chat:
 - `/exit` — Quit
 - `/clear` — Reset conversation history
 - `/help` — Show commands
+- `/tools` — List available tools (when tools are active)
 
 ---
 
@@ -108,7 +169,7 @@ CLI commands during chat:
 - **Type hints:** Used everywhere (function signatures, class attributes)
 - **Docstrings:** Every module, class, and public method has a docstring
 - **Config:** All config lives in `.env`, loaded by `config/settings.py`; never hardcode secrets
-- **Dependencies:** Minimal — `openai` and `python-dotenv` only; add new deps to `requirements.txt`
+- **Dependencies:** Minimal — `openai`, `python-dotenv`, and `mcp`; add new deps to `requirements.txt`
 - **Naming:** snake_case for files/variables/functions, PascalCase for classes
 - **Error handling:** `Agent.chat()` catches all exceptions and returns error strings rather than crashing the CLI loop
 
@@ -121,24 +182,30 @@ CLI commands during chat:
 | CLI chat with DeepSeek | ✅ Working |
 | Conversation history | ✅ Working |
 | `--test` flag | ✅ Working |
-| Tool framework (`BaseTool`) | ✅ Defined, not wired into agent |
-| Google Calendar | 🔴 Stub only |
+| `--test-tools` flag | ✅ Working |
+| Tool framework (`BaseTool`) | ✅ Defined |
+| MCP client layer (`MCPClient`, `MCPManager`) | ✅ Implemented (Phase 1) |
+| In-process tool adapter (`InProcessMCPAdapter`) | ✅ Implemented (Phase 2) |
+| Mock calendar MCP server (Python) | ✅ Implemented (Phase 2) |
+| Tool-calling loop in agent | ✅ Implemented (Phase 3) |
+| `mcp_servers.json` config | ✅ Created |
+| Google Calendar (real API) | 🔴 Mock only |
 | Gmail | 🔴 Stub only |
 | WhatsApp | 🔴 Stub only |
 | Telegram | 🔴 Stub only |
-| Function calling / tool use | 🔴 Not implemented |
-| Multi-turn with tools | 🔴 Not implemented |
+| External MCP server (stdio) | ⚠️ anyio/Python 3.14 issue |
 
 ---
 
 ## 7. Future Roadmap (Planned by User)
 
-1. **Wire up tool system** — allow the agent to actually call tools via DeepSeek's function calling
-2. **Google Calendar integration** — `CalendarTool` full implementation using Google Calendar API
-3. **Gmail integration** — `EmailTool` full implementation using Gmail API
-4. **WhatsApp integration** — via Twilio or WhatsApp Business API
-5. **Telegram integration** — via Telegram Bot API
-6. **Bot interfaces** — replace CLI with WhatsApp bot and/or Telegram bot as entry points
+1. ~~**Wire up tool system**~~ ✅ — agent can call tools via DeepSeek's function calling
+2. ~~**Google Calendar integration (mock)**~~ ✅ — in-process mock calendar with CRUD
+3. **Google Calendar (real API)** — swap mock handlers with Google Calendar API calls
+4. **Gmail integration** — `EmailTool` using Gmail API
+5. **WhatsApp integration** — via Twilio or WhatsApp Business API
+6. **Telegram integration** — via Telegram Bot API
+7. **Bot interfaces** — replace CLI with WhatsApp bot and/or Telegram bot as entry points
 
 ---
 
@@ -149,6 +216,9 @@ CLI commands during chat:
 | Change system prompt / agent personality | `agent/core.py` (`Agent.SYSTEM_PROMPT`) |
 | Add a new tool | Create in `agent/tools/`, extend `BaseTool` |
 | Wire tools into agent | `agent/core.py` (add tool-calling loop) |
+| Add a new MCP server | Add entry to `mcp_servers.json` |
+| Change MCP client transport | `agent/mcp/client.py` |
+| Add in-process tool | `agent/mcp/adapters.py` |
 | Change model parameters | `.env` or `config/settings.py` |
 | Add new CLI commands | `agent/cli.py` |
 | Switch to a different LLM provider | `agent/core.py` (change base_url/model) + `config/settings.py` |
@@ -166,3 +236,13 @@ CLI commands during chat:
 - The OpenAI SDK is used only as an HTTP client — it is pointed at `https://api.deepseek.com/v1`, which is DeepSeek's OpenAI-compatible endpoint. This means OpenAI SDK features like streaming, function calling, etc. should work if DeepSeek supports them.
 - Keep dependencies minimal. The user wants a lightweight scaffold.
 - When the agent adds tool calling, the pattern would be: user message → agent decides to call tool → execute tool → send tool result back → agent formulates final response.
+
+### MCP Architecture Notes
+
+- **`MCPClient`** (`agent/mcp/client.py`) handles a single MCP server connection via stdio. It launches the server as a subprocess, initializes an MCP session, and exposes `list_tools()` / `call_tool()`.
+- **`MCPManager`** (`agent/mcp/manager.py`) reads `mcp_servers.json`, starts all configured servers, and maintains a tool registry mapping tool names → servers.
+- **`InProcessMCPAdapter`** (`agent/mcp/adapters.py`) provides the same interface without spawning subprocesses. Tools are registered directly and called as Python functions. This avoids the anyio/Python 3.14 stdio transport issue.
+- **`mcp_servers.json`** is the single source of truth for which MCP servers the agent connects to. Each server entry needs `command`, optional `args`, and optional `env` (with `${VAR}` substitution).
+- The MCP Python SDK (`mcp` on PyPI) provides `ClientSession`, `StdioServerParameters`, and `stdio_client`.
+- In Phase 3, `Agent.chat_with_history()` will be extended to accept MCP tool definitions and handle tool-calling responses from the LLM.
+- MCP servers run as separate OS processes — the agent does not bundle Google API logic directly.

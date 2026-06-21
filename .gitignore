@@ -1,6 +1,10 @@
 # Environment files
 .env
 
+# Google OAuth (contains secrets)
+credentials_calendar.json
+token_calendar.pickle
+
 # Python
 __pycache__/
 *.py[cod]
